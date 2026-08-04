@@ -1,0 +1,12 @@
+.venv/
+.agents/
+.opencode/
+.serena/
+.ruff_cache/
+dist/
+__pycache__/
+*.py[cod]
+docs/generated/
+.env
+.env.*
+!.env.example
