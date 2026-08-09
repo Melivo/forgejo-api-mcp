@@ -20,6 +20,7 @@ import httpx
 
 from .catalog import Operation, OperationCatalog
 from .errors import ConfigurationError, InputValidationError
+from .provider_auth import classify_token
 
 DEFAULT_BASE_URL = "https://forgejo.invalid"
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -833,4 +834,37 @@ class ForgejoClient:
             "status_code": 0,
             "ok": False,
             "error": {"kind": kind, "message": message},
+        }
+
+    async def probe_auth(self) -> dict[str, Any]:
+        """Probe the STARTUP-snapshotted credential with ``GET /api/v1/user`` and return a redacted status.
+
+        The output exposes constant ``usesStartupSnapshot`` and ``restartRequiredAfterRotation``
+        booleans plus a ``snapshotStatus`` reflecting only the current probe of the token captured
+        once at server import. It deliberately never infers that a restart is unnecessary from a
+        current HTTP 200. Classifies a 401 as ``credential_rejected``. Never returns the token,
+        the ``Authorization`` header value, or the response body. The probe reuses this client's
+        process snapshot; it never re-reads the environment or Windows Credential Manager.
+        """
+
+        if not self._token:
+            return {
+                "usesStartupSnapshot": True,
+                "restartRequiredAfterRotation": True,
+                "snapshotStatus": "unconfigured",
+                "status_code": 0,
+                "detail": "No FORGEJO_ACCESS_TOKEN was configured at process start; rotation always requires a restart.",
+            }
+        classification = await classify_token(
+            self._token,
+            base_url=self.base_url,
+            transport=self._transport,
+            timeout=self.timeout,
+        )
+        return {
+            "usesStartupSnapshot": True,
+            "restartRequiredAfterRotation": True,
+            "snapshotStatus": classification.status,
+            "status_code": classification.status_code,
+            "detail": classification.detail,
         }

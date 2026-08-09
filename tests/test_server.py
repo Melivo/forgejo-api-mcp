@@ -9,13 +9,21 @@ from forgejo_api_mcp import server as server_module
 
 
 @pytest.mark.asyncio
-async def test_server_registers_discovery_detail_and_invocation_tools() -> None:
+async def test_server_registers_discovery_detail_invocation_and_status_tools() -> None:
     tools = {tool.name: tool for tool in await server_module.server.list_tools()}
 
-    assert set(tools) == {"list_operations", "get_operation", "invoke_operation"}
+    assert set(tools) == {
+        "list_operations",
+        "get_operation",
+        "invoke_operation",
+        "provider_auth_status",
+    }
     assert tools["list_operations"].annotations.read_only_hint is True
     assert tools["get_operation"].annotations.read_only_hint is True
     assert tools["invoke_operation"].annotations.destructive_hint is True
+    assert tools["provider_auth_status"].annotations.read_only_hint is True
+    assert tools["provider_auth_status"].annotations.idempotent_hint is True
+    assert tools["provider_auth_status"].annotations.destructive_hint is False
     assert "explicit user confirmation" in tools["invoke_operation"].description
 
 
@@ -121,3 +129,92 @@ def test_main_runs_stdio_only(monkeypatch: pytest.MonkeyPatch) -> None:
     server_module.main()
 
     assert captured == {"transport": "stdio", "kwargs": {}}
+
+
+@pytest.mark.asyncio
+async def test_provider_auth_status_reports_authenticated_for_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/user"
+        return httpx.Response(200, json={"login": "alice"}, request=request)
+
+    probe_client = server_module.ForgejoClient.from_environment(server_module.catalog)
+    probe_client._transport = httpx.MockTransport(handle_request)
+    probe_client._token = "good"
+    probe_client._token_bytes = b"good"
+    monkeypatch.setattr(server_module, "client", probe_client)
+
+    result = await server_module.provider_auth_status()
+
+    assert result["snapshotStatus"] == "authenticated"
+    assert "login" not in result
+    assert result["usesStartupSnapshot"] is True
+    assert result["restartRequiredAfterRotation"] is True
+    assert "restartRequired" not in result
+    assert "good" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_provider_auth_status_classifies_401_as_credential_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, request=request)
+
+    probe_client = server_module.ForgejoClient.from_environment(server_module.catalog)
+    probe_client._transport = httpx.MockTransport(handle_request)
+    probe_client._token = "stale"
+    probe_client._token_bytes = b"stale"
+    monkeypatch.setattr(server_module, "client", probe_client)
+
+    result = await server_module.provider_auth_status()
+
+    assert result["snapshotStatus"] == "credential_rejected"
+    assert result["status_code"] == 401
+    assert result["restartRequiredAfterRotation"] is True
+    assert "stale" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_provider_auth_status_reports_unconfigured_without_a_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_client = server_module.ForgejoClient(
+        server_module.catalog, "https://forgejo.example", None
+    )
+    monkeypatch.setattr(server_module, "client", probe_client)
+
+    result = await server_module.provider_auth_status()
+
+    assert result["snapshotStatus"] == "unconfigured"
+    assert result["usesStartupSnapshot"] is True
+    assert result["restartRequiredAfterRotation"] is True
+    assert "login" not in result
+
+
+@pytest.mark.asyncio
+async def test_provider_auth_status_rejects_insecure_base_without_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, request=request)
+
+    probe_client = server_module.ForgejoClient(
+        server_module.catalog,
+        "http://localhost:3000",
+        "candidate",
+        allow_insecure_localhost=True,
+        transport=httpx.MockTransport(handle_request),
+    )
+    monkeypatch.setattr(server_module, "client", probe_client)
+
+    result = await server_module.provider_auth_status()
+
+    assert result["snapshotStatus"] == "insecure_base_url"
+    assert result["status_code"] == 0
+    assert result["restartRequiredAfterRotation"] is True
+    assert requests == []

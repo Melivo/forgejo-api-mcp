@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 forgejo-api-mcp = "forgejo_api_mcp.server:main"
+forgejo-api-mcp-rotate = "forgejo_api_mcp.rotate:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/forgejo_api_mcp"]

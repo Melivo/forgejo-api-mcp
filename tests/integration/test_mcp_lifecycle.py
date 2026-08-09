@@ -67,6 +67,7 @@ async def test_stdio_protocol_lifecycle_with_mocked_http() -> None:
             "list_operations",
             "get_operation",
             "invoke_operation",
+            "provider_auth_status",
         }
 
         successful = await session.call_tool(

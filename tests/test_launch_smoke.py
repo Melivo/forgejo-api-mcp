@@ -54,3 +54,25 @@ def test_launch_requirements_use_the_existing_wrapper_without_a_secret_value() -
     assert '"FORGEJO_ACCESS_TOKEN":' not in document
     assert "forgejo-api-mcp" in document
     assert "stdio" in document
+
+
+def test_rotation_doc_documents_command_target_restart_and_redaction() -> None:
+    document = (PROJECT_ROOT / "docs" / "credential-rotation.md").read_text(encoding="utf-8")
+
+    assert "forgejo-api-mcp-rotate" in document
+    assert "mcp/forgejo-mcp/access-token" in document
+    assert "restart" in document.casefold()
+    assert "credential_rejected" in document
+    assert "tokenSha256" not in document
+    assert "--username" not in document
+    assert "UserName is fixed" in document
+    assert "HTTPS" in document
+    assert "status-only" in document
+    assert "absolute" in document
+    assert "| 18 |" in document
+    assert "user-scoped Windows named mutex" in document
+    assert "Mandatory redacted local launcher verification" in document
+    assert "credential-exec.ps1" in document
+    assert "PASS" in document and "FAIL" in document
+    assert "provider_auth_status" in document
+    assert "<token>" not in document

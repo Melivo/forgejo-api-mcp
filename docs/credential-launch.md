@@ -66,3 +66,12 @@ application default.
 5. The wrapper restores its previous process environment when the child exits.
 
 Never place the credential in the JSONC entry, shell history, test data, logs, or error reports.
+
+## Rotating a stale token
+
+This launch flow injects the token once at process start; the running server keeps that
+snapshot until it restarts. To replace an expired/rotated token and to diagnose `401`s, use the
+project-owned rotation CLI and the `provider_auth_status` probe described in
+[`credential-rotation.md`](credential-rotation.md). Rotation updates the credential store but
+does **not** affect the already-running process — restart the server afterward so this wrapper
+reloads the fresh token.

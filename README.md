@@ -108,6 +108,19 @@ The bundled OpenAPI snapshot is a reviewed artifact, not a runtime download. See
 record the Forgejo server version, operation-count diff, and test results before
 accepting a snapshot change.
 
+## Rotate the Forgejo token
+
+When a token expires or is rotated, the running server keeps its startup snapshot and Forgejo
+returns `401`. Rotate the token with the project-owned CLI (token read from stdin only) and
+confirm the result with the `provider_auth_status` tool, then restart the server:
+
+```powershell
+uv run forgejo-api-mcp-rotate
+```
+
+See [docs/credential-rotation.md](docs/credential-rotation.md) for the validate-before-write
+flow, redacted output, exit codes, and the restart requirement.
+
 ## Development
 
 ```powershell

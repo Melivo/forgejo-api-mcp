@@ -110,6 +110,28 @@ async def invoke_operation(
     )
 
 
+@server.tool(
+    description=(
+        "Probe the STARTUP-snapshotted Forgejo credential with a strict-HTTPS, redirect-disabled, "
+        "status-only GET /api/v1/user under an absolute <=30s deadline; the response body is never "
+        "consumed. This tool does NOT re-read Windows Credential Manager. A 401 is classified as "
+        "credential_rejected. Rotation ALWAYS requires restarting the MCP server "
+        "(restartRequiredAfterRotation=true), even when the current snapshot returns HTTP 200. "
+        "Never returns the token, header value, response body, or provider login."
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def provider_auth_status() -> dict[str, Any]:
+    """Return a redacted provider-auth status for the startup-snapshotted credential."""
+
+    return await client.probe_auth()
+
+
 def main() -> None:
     """Run only the MCP stdio transport; this process opens no HTTP listener."""
 
