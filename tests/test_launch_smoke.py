@@ -69,8 +69,9 @@ def test_rotation_doc_documents_command_target_restart_and_redaction() -> None:
     assert "HTTPS" in document
     assert "status-only" in document
     assert "absolute" in document
-    assert "| 18 |" in document
-    assert "user-scoped Windows named mutex" in document
+    assert "credentialState: unknown" in document
+    assert "Global\\\\forgejo-api-mcp-rotate-<current-user-SID>" in document
+    assert "protected DACL" in document
     assert "Mandatory redacted local launcher verification" in document
     assert "credential-exec.ps1" in document
     assert "PASS" in document and "FAIL" in document

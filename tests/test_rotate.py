@@ -4,7 +4,6 @@ import io
 import json
 import sys
 import threading
-import types
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
@@ -12,12 +11,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from forgejo_api_mcp.credentials import (
-    CRED_PERSIST_LOCAL_MACHINE,
+from forgejo_api_mcp.credential_backend import (
     TARGET_NAME,
-    CredentialRecord,
-    CredentialStoreError,
-    RotationMutexTimeout,
+    CredentialCategory,
+    CredentialOperationError,
 )
 from forgejo_api_mcp.rotate import (
     EXIT_CREDENTIAL_REJECTED,
@@ -37,37 +34,64 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BASE_URL = "https://forgejo.example/api/v1"
 
 
+class Snapshot:
+    def __init__(self, token: str | None) -> None:
+        self.token = token
+        self.discarded = False
+
+    @property
+    def present(self) -> bool:
+        return not self.discarded and self.token is not None
+
+    def __repr__(self) -> str:
+        return "Snapshot(<redacted>)"
+
+
 class RotateFakeStore:
     def __init__(self, *, initial: str | None = None, readback: str | None = None) -> None:
-        self._record = self._make_record(initial) if initial is not None else None
+        self.record = initial
         self._readback = readback
         self._forced_readback_used = False
         self.writes: list[str] = []
         self.deleted: list[str] = []
 
-    @staticmethod
-    def _make_record(token: str) -> CredentialRecord:
-        return CredentialRecord(
-            TARGET_NAME, "forgejo-api-mcp", token, CRED_PERSIST_LOCAL_MACHINE
-        )
+    def availability(self) -> CredentialCategory:
+        return CredentialCategory.AVAILABLE
 
-    def write(self, token: str) -> None:
+    def snapshot(self) -> Snapshot:
+        return Snapshot(self.record)
+
+    def replace_existing(self, token: str) -> None:
         self.writes.append(token)
-        self._record = self._make_record(token)
+        self.record = token
 
-    def read(self) -> CredentialRecord | None:
+    def read(self) -> str:
         if self._readback is not None and self.writes and not self._forced_readback_used:
             self._forced_readback_used = True
-            return self._make_record(self._readback)
-        return self._record
+            return self._readback
+        if self.record is None:
+            raise CredentialOperationError(
+                CredentialCategory.MISSING,
+                credential_state="unchanged",
+                operation="read",
+            )
+        return self.record
 
-    def delete(self) -> None:
-        self.deleted.append(TARGET_NAME)
-        self._record = None
+    def restore(self, snapshot: Snapshot) -> None:
+        if snapshot.token is None:
+            self.deleted.append(TARGET_NAME)
+            self.record = None
+        else:
+            self.writes.append(snapshot.token)
+            self.record = snapshot.token
 
-    def restore(self, record: CredentialRecord) -> None:
-        self.writes.append(record.credential_blob)
-        self._record = record
+    def discard(self, snapshot: Snapshot) -> None:
+        snapshot.token = None
+        snapshot.discarded = True
+
+    def lock(self, *, timeout: float):
+        del timeout
+        return nullcontext()
 
     @property
     def last_written(self) -> str | None:
@@ -184,21 +208,18 @@ def test_run_readback_mismatch_restores_prior_when_present() -> None:
     assert store.deleted == []
 
 
-def test_run_reports_platform_unsupported() -> None:
-    from forgejo_api_mcp.credentials import CredentialStoreUnavailable
+def test_run_reports_platform_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
+    from forgejo_api_mcp import rotate
+    from forgejo_api_mcp.credential_backend import PlatformUnsupported
 
-    def boom() -> None:
-        raise CredentialStoreUnavailable("non-windows")
+    def boom() -> object:
+        raise PlatformUnsupported("unsupported")
 
-    store = types.SimpleNamespace(
-        ensure_available=boom,
-        write=lambda token: None,
-        read=lambda: None,
-        delete=lambda: None,
-        restore=lambda record: None,
-    )
+    monkeypatch.setattr(rotate, "_default_store", boom)
     code, output = _run(
-        "good-token", base_url=BASE_URL, transport=httpx.MockTransport(_ok_handler), store=store
+        "good-token",
+        base_url=BASE_URL,
+        transport=httpx.MockTransport(_ok_handler),
     )
     assert code == EXIT_PLATFORM_UNSUPPORTED
     assert output["status"] == "platform_unsupported"
@@ -332,6 +353,96 @@ def test_main_rejects_non_https_base_url_with_zero_requests_and_zero_writes(
     assert store.writes == []
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://[",
+        "https:///missing-host",
+        "https://user:password@forgejo.example",
+        "https://forgejo.example?private=query",
+        "https://forgejo.example?",
+        "https://forgejo.example#private-fragment",
+        "https://forgejo.example#",
+        "https://bad host.example",
+        "https://forgejo.example:not-a-port",
+        "https://forgejo.example:99999",
+    ],
+)
+def test_main_rejects_malformed_or_credential_bearing_base_url_redacted(
+    base_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class UnreadableStdin:
+        def isatty(self) -> bool:
+            raise AssertionError("invalid base URL must be rejected before stdin")
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, request=request)
+
+    monkeypatch.setattr(sys, "stdin", UnreadableStdin())
+    monkeypatch.setenv("FORGEJO_BASE_URL", base_url)
+    store = RotateFakeStore()
+    code = main([], transport=httpx.MockTransport(handler), store=store)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert code == EXIT_INVALID_INPUT
+    assert payload["status"] == "invalid_input"
+    assert payload["detail"] == "Forgejo base URL is invalid."
+    assert base_url not in captured.out
+    assert base_url not in captured.err
+    assert requests == []
+    assert store.writes == []
+
+
+@pytest.mark.parametrize("codepoint", [*range(0x20), 0x7F])
+def test_run_rejects_every_c0_and_del_character_anywhere_in_url(
+    codepoint: int,
+) -> None:
+    base_url = f"https://forgejo.example/path{chr(codepoint)}segment"
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, request=request)
+
+    store = RotateFakeStore()
+    code, payload = _run(
+        "candidate",
+        base_url=base_url,
+        transport=httpx.MockTransport(handler),
+        store=store,
+    )
+    assert code == EXIT_INVALID_INPUT
+    assert payload["status"] == "invalid_input"
+    assert payload["detail"] == "Forgejo base URL is invalid."
+    assert base_url not in json.dumps(payload)
+    assert requests == []
+    assert store.writes == []
+
+
+def test_run_redacts_httpx_invalid_url_from_client_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from forgejo_api_mcp import rotate
+
+    raw_url = "https://forgejo.example/raw-invalid-url-canary"
+
+    async def invalid_url(*_args: object, **_kwargs: object) -> object:
+        raise httpx.InvalidURL(raw_url)
+
+    monkeypatch.setattr(rotate, "classify_token", invalid_url)
+    code, output = rotate._run("candidate", base_url=BASE_URL, store=RotateFakeStore())
+    rendered = json.dumps(output)
+    assert code == EXIT_INVALID_INPUT
+    assert output["status"] == "invalid_input"
+    assert output["detail"] == "Forgejo base URL is invalid."
+    assert raw_url not in rendered
+
+
 def test_main_takes_no_token_argument(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -369,30 +480,45 @@ def test_main_does_not_read_secret_env(
 
 
 class ContractStore:
-    def __init__(self, initial: CredentialRecord | None = None) -> None:
+    def __init__(self, initial: str | None = None) -> None:
         self.record = initial
         self.writes = 0
 
-    def read(self) -> CredentialRecord | None:
+    def availability(self) -> CredentialCategory:
+        return CredentialCategory.AVAILABLE
+
+    def snapshot(self) -> Snapshot:
+        return Snapshot(self.record)
+
+    def read(self) -> str:
+        if self.record is None:
+            raise CredentialOperationError(
+                CredentialCategory.MISSING,
+                credential_state="unchanged",
+                operation="read",
+            )
         return self.record
 
-    def write(self, token: str) -> None:
+    def replace_existing(self, token: str) -> None:
         self.writes += 1
-        self.record = CredentialRecord(
-            TARGET_NAME, "forgejo-api-mcp", token, CRED_PERSIST_LOCAL_MACHINE
-        )
+        self.record = token
 
-    def delete(self) -> None:
-        self.record = None
+    def restore(self, snapshot: Snapshot) -> None:
+        self.record = snapshot.token
 
-    def restore(self, record: CredentialRecord) -> None:
-        self.record = record
+    def discard(self, snapshot: Snapshot) -> None:
+        snapshot.token = None
+        snapshot.discarded = True
+
+    def lock(self, *, timeout: float):
+        del timeout
+        return nullcontext()
 
 
 class FaultStore(ContractStore):
     def __init__(
         self,
-        initial: CredentialRecord | None = None,
+        initial: str | None = None,
         *,
         fail_read_numbers: set[int] | None = None,
         fail_write: bool = False,
@@ -406,33 +532,52 @@ class FaultStore(ContractStore):
         self.fail_restore = fail_restore
         self.fail_delete = fail_delete
 
-    def read(self) -> CredentialRecord | None:
+    def _fail_read(self, operation: str) -> None:
         self.read_number += 1
         if self.read_number in self.fail_read_numbers:
-            raise CredentialStoreError("synthetic read failure")
+            raise CredentialOperationError(
+                CredentialCategory.STORE_ERROR,
+                credential_state="unchanged",
+                operation=operation,
+            )
+
+    def snapshot(self) -> Snapshot:
+        self._fail_read("snapshot")
+        return super().snapshot()
+
+    def read(self) -> str:
+        self._fail_read("read")
         return super().read()
 
-    def write(self, token: str) -> None:
+    def replace_existing(self, token: str) -> None:
         if self.fail_write:
-            raise CredentialStoreError("synthetic write failure")
-        super().write(token)
+            raise CredentialOperationError(
+                CredentialCategory.STORE_ERROR,
+                credential_state="unchanged",
+                operation="replace_existing",
+            )
+        super().replace_existing(token)
 
-    def restore(self, record: CredentialRecord) -> None:
-        if self.fail_restore:
-            raise CredentialStoreError("synthetic restore failure")
-        super().restore(record)
-
-    def delete(self) -> None:
-        if self.fail_delete:
-            raise CredentialStoreError("synthetic delete failure")
-        super().delete()
+    def restore(self, snapshot: Snapshot) -> None:
+        failed = self.fail_delete if snapshot.token is None else self.fail_restore
+        if failed:
+            raise CredentialOperationError(
+                CredentialCategory.STORE_ERROR,
+                credential_state="unknown",
+                operation="restore",
+            )
+        super().restore(snapshot)
 
 
 def test_run_lock_timeout_is_store_error_with_zero_writes() -> None:
     store = ContractStore()
 
     def lock_timeout(**_kwargs: object):
-        raise RotationMutexTimeout("rotation lock timed out")
+        raise CredentialOperationError(
+            CredentialCategory.TIMEOUT,
+            credential_state="unchanged",
+            operation="lock",
+        )
 
     code, output = _run(
         "candidate",
@@ -498,16 +643,11 @@ def test_run_write_failure_is_unchanged() -> None:
     ("initial", "expected_state"),
     [
         (None, "deleted_new"),
-        (
-            CredentialRecord(
-                TARGET_NAME, "forgejo-api-mcp", "prior", CRED_PERSIST_LOCAL_MACHINE
-            ),
-            "restored",
-        ),
+        ("prior", "restored"),
     ],
 )
 def test_run_readback_failure_performs_verified_rollback(
-    initial: CredentialRecord | None, expected_state: str
+    initial: str | None, expected_state: str
 ) -> None:
     store = FaultStore(initial, fail_read_numbers={2})
     code, output = _run(
@@ -523,9 +663,7 @@ def test_run_readback_failure_performs_verified_rollback(
 
 
 def test_run_rollback_verification_failure_reports_unknown() -> None:
-    prior = CredentialRecord(
-        TARGET_NAME, "forgejo-api-mcp", "prior", CRED_PERSIST_LOCAL_MACHINE
-    )
+    prior = "prior"
     store = FaultStore(prior, fail_read_numbers={2}, fail_restore=True)
     code, output = _run(
         "candidate",
@@ -539,31 +677,31 @@ def test_run_rollback_verification_failure_reports_unknown() -> None:
     assert output["restartRequired"] is False
 
 
-def test_main_checks_platform_before_stdin_or_network(
+def test_main_and_run_ignore_legacy_availability_preflight(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     requests: list[httpx.Request] = []
+    store = RotateFakeStore()
+    availability_calls = 0
 
-    class UnreadableStdin:
-        def isatty(self) -> bool:
-            raise AssertionError("stdin must not be inspected")
-
-    def unavailable() -> None:
-        from forgejo_api_mcp.credentials import CredentialStoreUnavailable
-
-        raise CredentialStoreUnavailable("not windows")
+    def forbidden_preflight() -> None:
+        nonlocal availability_calls
+        availability_calls += 1
+        raise AssertionError("legacy availability preflight must not run")
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         return httpx.Response(200, request=request)
 
-    monkeypatch.setattr(sys, "stdin", UnreadableStdin())
-    store = types.SimpleNamespace(ensure_available=unavailable)
+    store.ensure_available = forbidden_preflight  # type: ignore[attr-defined]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("candidate\n"))
+    monkeypatch.setenv("FORGEJO_BASE_URL", BASE_URL)
     code = main([], transport=httpx.MockTransport(handler), store=store)
     output = json.loads(capsys.readouterr().out)
-    assert code == EXIT_PLATFORM_UNSUPPORTED
-    assert output["credentialState"] == "unavailable"
-    assert requests == []
+    assert code == EXIT_ROTATED
+    assert output["credentialState"] == "written"
+    assert availability_calls == 0
+    assert len(requests) == 1
 
 
 def test_two_rotations_serialize_the_store_transaction() -> None:
@@ -590,13 +728,13 @@ def test_two_rotations_serialize_the_store_transaction() -> None:
                 active -= 1
             mutex.release()
 
-    original_write = store.write
+    original_write = store.replace_existing
 
     def tracked_write(token: str) -> None:
         store.write_order.append(token)  # type: ignore[attr-defined]
         original_write(token)
 
-    store.write = tracked_write  # type: ignore[method-assign]
+    store.replace_existing = tracked_write  # type: ignore[method-assign]
 
     def handler(request: httpx.Request) -> httpx.Response:
         validation_barrier.wait(timeout=2)
@@ -617,4 +755,4 @@ def test_two_rotations_serialize_the_store_transaction() -> None:
     assert [result[0] for result in results] == [EXIT_ROTATED, EXIT_ROTATED]
     assert max_active == 1
     assert store.record is not None
-    assert store.record.credential_blob == store.write_order[-1]  # type: ignore[attr-defined]
+    assert store.record == store.write_order[-1]  # type: ignore[attr-defined]

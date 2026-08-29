@@ -12,6 +12,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_PROBE = """
 import json
+from importlib.metadata import distribution
 from importlib.resources import files
 from pathlib import Path
 
@@ -19,12 +20,21 @@ import forgejo_api_mcp
 from forgejo_api_mcp.catalog import OperationCatalog
 
 resource = files("forgejo_api_mcp").joinpath("openapi.json")
+worker_resource = files("forgejo_api_mcp").joinpath("secretstorage_worker.py")
 catalog = OperationCatalog.bundled()
+package = distribution("forgejo-api-mcp")
 print(json.dumps({
     "count": len(catalog),
     "version": catalog.version,
     "resource_exists": resource.is_file(),
+    "worker_resource_exists": worker_resource.is_file(),
     "module_path": str(Path(forgejo_api_mcp.__file__).resolve()),
+    "requires": package.requires,
+    "scripts": {
+        entry.name: entry.value
+        for entry in package.entry_points
+        if entry.group == "console_scripts"
+    },
 }))
 """
 
@@ -97,6 +107,23 @@ def test_built_artifact_installs_isolated_with_bundled_catalog(
     result = json.loads(completed.stdout)
 
     assert result["resource_exists"] is True
+    assert result["worker_resource_exists"] is True
     assert result["version"] == "1.25.4"
     assert result["count"] == 467
     assert not Path(result["module_path"]).is_relative_to(PROJECT_ROOT)
+    assert result["scripts"] == {
+        "forgejo-api-mcp": "forgejo_api_mcp.server:main",
+        "forgejo-api-mcp-launch": "forgejo_api_mcp.launcher:main",
+        "forgejo-api-mcp-quarantine": "forgejo_api_mcp.quarantine:main",
+        "forgejo-api-mcp-rotate": "forgejo_api_mcp.rotate:main",
+    }
+    secretstorage = [
+        requirement
+        for requirement in result["requires"]
+        if requirement.casefold().startswith("secretstorage")
+    ]
+    assert secretstorage == ["secretstorage<4,>=3.5; sys_platform == 'linux'"]
+    assert not any(
+        requirement.casefold().startswith(("jeepney", "cryptography"))
+        for requirement in result["requires"]
+    )

@@ -11,18 +11,22 @@ uses solely to verify a readback.
 from __future__ import annotations
 
 import ctypes
-import getpass
-import hashlib
 import math
 import sys
 import types
+from contextlib import AbstractContextManager
 from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Any, Self
 
-from .errors import ForgejoMCPError
+from .credential_backend import (
+    TARGET_NAME,
+    CredentialBackendError,
+    CredentialCategory,
+    CredentialOperationError,
+    CredentialSnapshot,
+)
 
-TARGET_NAME = "mcp/forgejo-mcp/access-token"
 USERNAME = "forgejo-api-mcp"
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
@@ -34,13 +38,17 @@ WAIT_TIMEOUT = 0x00000102
 WAIT_FAILED = 0xFFFFFFFF
 TOKEN_QUERY = 0x0008
 TOKEN_USER_CLASS = 1
+SDDL_REVISION_1 = 1
+MUTEX_MODIFY_STATE = 0x0001
+SYNCHRONIZE = 0x00100000
+MUTEX_REQUIRED_ACCESS = MUTEX_MODIFY_STATE | SYNCHRONIZE
 
 
-class CredentialStoreUnavailable(ForgejoMCPError):
+class CredentialStoreUnavailable(CredentialBackendError):
     """Raised when the Windows Credential Manager is not available (non-Windows host)."""
 
 
-class CredentialStoreError(ForgejoMCPError):
+class CredentialStoreError(CredentialBackendError):
     """Raised when a Windows Credential Manager operation fails."""
 
 
@@ -90,6 +98,14 @@ class _SID_AND_ATTRIBUTES(ctypes.Structure):
 
 class _TOKEN_USER(ctypes.Structure):
     _fields_ = [("User", _SID_AND_ATTRIBUTES)]
+
+
+class _SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("nLength", wintypes.DWORD),
+        ("lpSecurityDescriptor", wintypes.LPVOID),
+        ("bInheritHandle", wintypes.BOOL),
+    ]
 
 
 def write_credential(token: str) -> None:
@@ -276,8 +292,13 @@ def _bind_advapi32() -> Any:
     library.GetTokenInformation.restype = wintypes.BOOL
     library.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)]
     library.ConvertSidToStringSidW.restype = wintypes.BOOL
-    library.GetUserNameW.argtypes = [wintypes.LPWSTR, wintypes.LPDWORD]
-    library.GetUserNameW.restype = wintypes.BOOL
+    library.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        wintypes.LPDWORD,
+    ]
+    library.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
     return library
 
 
@@ -294,8 +315,13 @@ def _load_kernel32() -> Any:
 
 def _bind_kernel32() -> Any:
     library = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-    library.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
-    library.CreateMutexW.restype = wintypes.HANDLE
+    library.CreateMutexExW.argtypes = [
+        ctypes.POINTER(_SECURITY_ATTRIBUTES),
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    library.CreateMutexExW.restype = wintypes.HANDLE
     library.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     library.WaitForSingleObject.restype = wintypes.DWORD
     library.ReleaseMutex.argtypes = [wintypes.HANDLE]
@@ -347,52 +373,89 @@ def _current_user_sid() -> str | None:
         kernel32.CloseHandle(token)
 
 
-def _fallback_user_identifier() -> str:
-    username = ""
-    try:
-        advapi32 = _load_advapi32()
-        size = wintypes.DWORD(257)
-        buffer = ctypes.create_unicode_buffer(size.value)
-        if advapi32.GetUserNameW(buffer, ctypes.byref(size)):
-            username = buffer.value
-    except CredentialStoreUnavailable:
-        raise
-    except (AttributeError, OSError):
-        username = ""
-    if not username:
-        try:
-            username = getpass.getuser()
-        except (ImportError, KeyError, OSError):
-            username = "unknown-user"
-    digest = hashlib.sha256(username.encode("utf-8", errors="replace")).hexdigest()[:24]
-    return f"user-{digest}"
+def _rotation_mutex_name(sid: str | None = None) -> str:
+    identifier = _current_user_sid() if sid is None else sid
+    if not identifier:
+        raise CredentialStoreError("current Windows user SID is unavailable")
+    return f"Global\\forgejo-api-mcp-rotate-{identifier}"
 
 
-def _rotation_mutex_name() -> str:
-    identifier = _current_user_sid() or _fallback_user_identifier()
-    return f"Local\\forgejo-api-mcp-rotate-{identifier}"
+def _build_mutex_security_attributes(
+    sid: str,
+    *,
+    advapi32: Any = None,
+) -> tuple[_SECURITY_ATTRIBUTES, wintypes.LPVOID]:
+    """Build a protected DACL granting only SYSTEM and the current SID mutex access."""
+
+    if not sid or not sid.startswith("S-") or "\x00" in sid:
+        raise CredentialStoreError("current Windows user SID is invalid")
+    library = advapi32 or _load_advapi32()
+    descriptor = wintypes.LPVOID()
+    sddl = (
+        "D:P"
+        f"(A;;0x{MUTEX_REQUIRED_ACCESS:08x};;;SY)"
+        f"(A;;0x{MUTEX_REQUIRED_ACCESS:08x};;;{sid})"
+    )
+    if not library.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl,
+        SDDL_REVISION_1,
+        ctypes.byref(descriptor),
+        None,
+    ):
+        raise _map_win32_error(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            ctypes.get_last_error(),
+        )
+    attributes = _SECURITY_ATTRIBUTES(
+        nLength=ctypes.sizeof(_SECURITY_ATTRIBUTES),
+        lpSecurityDescriptor=descriptor,
+        bInheritHandle=False,
+    )
+    return attributes, descriptor
 
 
 class _RotationLock:
     """Bounded context manager around the user-scoped Windows named mutex."""
 
-    def __init__(self, *, timeout: float, kernel32: Any = None, name: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float,
+        kernel32: Any = None,
+        name: str | None = None,
+        sid: str | None = None,
+    ) -> None:
         self.timeout = max(0.0, min(float(timeout), DEFAULT_LOCK_TIMEOUT_SECONDS))
         self.kernel32 = kernel32
         self.name = name
+        self.sid = sid
         self.handle: Any = None
         self.abandoned = False
         self._owned = False
 
     def __enter__(self) -> Self:
         library = self.kernel32 or _load_kernel32()
-        name = self.name or _rotation_mutex_name()
-        if not name.startswith("Local\\") or name.startswith("Global\\"):
-            raise CredentialStoreError("rotation mutex must use the Local namespace")
-        handle = library.CreateMutexW(None, False, name)
+        sid = self.sid or _current_user_sid()
+        if not sid:
+            raise CredentialStoreError("current Windows user SID is unavailable")
+        expected_name = _rotation_mutex_name(sid)
+        name = self.name or expected_name
+        if name != expected_name:
+            raise CredentialStoreError("rotation mutex name must match the current user SID")
+        attributes, descriptor = _build_mutex_security_attributes(sid)
+        try:
+            handle = library.CreateMutexExW(
+                ctypes.byref(attributes),
+                name,
+                0,
+                MUTEX_REQUIRED_ACCESS,
+            )
+        finally:
+            library.LocalFree(descriptor)
         if not handle:
-            raise _map_win32_error("CreateMutexW", ctypes.get_last_error())
+            raise _map_win32_error("CreateMutexExW", ctypes.get_last_error())
         self.kernel32 = library
+        self.name = name
         self.handle = handle
         milliseconds = min(math.ceil(self.timeout * 1000), 0xFFFFFFFE)
         result = int(library.WaitForSingleObject(handle, milliseconds))
@@ -438,12 +501,13 @@ def _rotation_lock(
     timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     kernel32: Any = None,
     name: str | None = None,
+    sid: str | None = None,
 ) -> _RotationLock:
     """Create the internal user-scoped rotation mutex context manager."""
 
     if kernel32 is None and sys.platform != "win32":
         raise CredentialStoreUnavailable("rotation mutex is only available on Windows")
-    return _RotationLock(timeout=timeout, kernel32=kernel32, name=name)
+    return _RotationLock(timeout=timeout, kernel32=kernel32, name=name, sid=sid)
 
 
 def _ensure_store_available() -> None:
@@ -451,6 +515,158 @@ def _ensure_store_available() -> None:
 
     _load_advapi32()
     _load_kernel32()
+
+
+class _WindowsSnapshot:
+    """Opaque Windows rollback record owned by :class:`WindowsCredentialBackend`."""
+
+    __slots__ = ("_discarded", "_record")
+
+    def __init__(self, record: CredentialRecord | None) -> None:
+        self._record = record
+        self._discarded = False
+
+    @property
+    def present(self) -> bool:
+        return not self._discarded and self._record is not None
+
+    def _require_record(self) -> CredentialRecord | None:
+        if self._discarded:
+            raise CredentialOperationError(
+                CredentialCategory.STORE_ERROR,
+                credential_state="unknown",
+                operation="restore",
+                guidance_id=None,
+            )
+        return self._record
+
+    def _discard(self) -> None:
+        self._record = None
+        self._discarded = True
+
+    def __repr__(self) -> str:
+        return "WindowsCredentialSnapshot(<redacted>)"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        raise TypeError("credential snapshots are not serializable")
+
+
+class _WindowsBackendRotationLock(AbstractContextManager["_WindowsBackendRotationLock"]):
+    """Normalize private Win32 mutex failures at the backend boundary."""
+
+    def __init__(self, lock: _RotationLock) -> None:
+        self._lock = lock
+
+    @staticmethod
+    def _error(error: CredentialBackendError) -> CredentialOperationError:
+        category = (
+            CredentialCategory.TIMEOUT
+            if isinstance(error, RotationMutexTimeout)
+            else CredentialCategory.STORE_ERROR
+        )
+        return CredentialOperationError(
+            category,
+            credential_state="unchanged",
+            operation="lock",
+            guidance_id=None,
+        )
+
+    def __enter__(self) -> Self:
+        try:
+            self._lock.__enter__()
+        except CredentialBackendError as error:
+            raise self._error(error) from None
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: types.TracebackType | None,
+    ) -> bool:
+        try:
+            return self._lock.__exit__(exc_type, exc, traceback)
+        except CredentialBackendError as error:
+            raise self._error(error) from None
+
+
+class WindowsCredentialBackend:
+    """Credential Manager with a SID-protected cross-session mutex behind the common contract."""
+
+    @staticmethod
+    def _error(operation: str, *, state: str = "unchanged") -> CredentialOperationError:
+        return CredentialOperationError(
+            CredentialCategory.STORE_ERROR,
+            credential_state=state,
+            operation=operation,
+            guidance_id=None,
+        )
+
+    def availability(self) -> CredentialCategory:
+        try:
+            _ensure_store_available()
+        except (CredentialStoreUnavailable, CredentialStoreError):
+            raise self._error("availability") from None
+        return CredentialCategory.AVAILABLE
+
+    def read(self) -> str:
+        try:
+            record = read_credential()
+        except (CredentialStoreUnavailable, CredentialStoreError):
+            raise self._error("read") from None
+        if record is None:
+            raise CredentialOperationError(
+                CredentialCategory.MISSING,
+                credential_state="unchanged",
+                operation="read",
+                guidance_id=None,
+            )
+        return record.credential_blob
+
+    def snapshot(self) -> CredentialSnapshot:
+        try:
+            return _WindowsSnapshot(read_credential())
+        except (CredentialStoreUnavailable, CredentialStoreError):
+            raise self._error("snapshot") from None
+
+    def replace_existing(self, token: str) -> None:
+        try:
+            write_credential(token)
+        except (CredentialStoreUnavailable, CredentialStoreError):
+            raise self._error("replace_existing", state="unchanged") from None
+
+    def restore(self, snapshot: CredentialSnapshot) -> None:
+        if not isinstance(snapshot, _WindowsSnapshot):
+            raise self._error("restore", state="unknown")
+        record = snapshot._require_record()
+        try:
+            if record is None:
+                delete_credential()
+                if read_credential() is not None:
+                    raise self._error("restore", state="unknown")
+            else:
+                restore_credential(record)
+                restored = read_credential()
+                if restored != record:
+                    raise self._error("restore", state="unknown")
+        except CredentialOperationError:
+            raise
+        except (CredentialStoreUnavailable, CredentialStoreError):
+            raise self._error("restore", state="unknown") from None
+
+    def discard(self, snapshot: CredentialSnapshot) -> None:
+        if not isinstance(snapshot, _WindowsSnapshot):
+            raise self._error("discard", state="unknown")
+        snapshot._discard()
+
+    def lock(self, *, timeout: float) -> AbstractContextManager[object]:
+        try:
+            lock = _rotation_lock(timeout=timeout)
+        except CredentialBackendError as error:
+            raise _WindowsBackendRotationLock._error(error) from None
+        return _WindowsBackendRotationLock(lock)
 
 
 _advapi32: Any = None

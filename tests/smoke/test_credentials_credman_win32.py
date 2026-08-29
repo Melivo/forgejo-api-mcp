@@ -36,3 +36,10 @@ def test_real_credman_round_trip_on_dedicated_nonproduction_target() -> None:
                 prior.credential_blob,
                 prior.persist_type,
             )
+
+
+def test_real_rotation_mutex_is_global_sid_scoped_and_bounded() -> None:
+    name = credentials._rotation_mutex_name()
+    assert name.startswith("Global\\forgejo-api-mcp-rotate-S-")
+    with credentials._rotation_lock(timeout=1.0) as lock:
+        assert lock.name == name

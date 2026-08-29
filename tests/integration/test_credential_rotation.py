@@ -3,14 +3,15 @@ from __future__ import annotations
 import io
 import json
 import sys
+from contextlib import nullcontext
 
 import httpx
 import pytest
 
-from forgejo_api_mcp.credentials import (
-    CRED_PERSIST_LOCAL_MACHINE,
+from forgejo_api_mcp.credential_backend import (
     TARGET_NAME,
-    CredentialRecord,
+    CredentialCategory,
+    CredentialOperationError,
 )
 from forgejo_api_mcp.rotate import (
     EXIT_CREDENTIAL_REJECTED,
@@ -20,35 +21,59 @@ from forgejo_api_mcp.rotate import (
 )
 
 
+class Snapshot:
+    def __init__(self, token: str | None) -> None:
+        self.token = token
+        self.discarded = False
+
+    @property
+    def present(self) -> bool:
+        return not self.discarded and self.token is not None
+
+
 class IntegrationStore:
-    def __init__(self, initial: CredentialRecord | None = None, *, mismatch_once: bool = False) -> None:
+    def __init__(self, initial: str | None = None, *, mismatch_once: bool = False) -> None:
         self.written: dict[str, object] = {}
         self.deleted = False
         self.record = initial
         self.mismatch_once = mismatch_once
         self.mismatch_used = False
 
-    def write(self, token: str) -> None:
-        self.written = {"target": TARGET_NAME, "token": token, "username": "forgejo-api-mcp"}
-        self.record = CredentialRecord(
-            TARGET_NAME, "forgejo-api-mcp", token, CRED_PERSIST_LOCAL_MACHINE
-        )
+    def availability(self) -> CredentialCategory:
+        return CredentialCategory.AVAILABLE
 
-    def read(self) -> CredentialRecord | None:
+    def snapshot(self) -> Snapshot:
+        return Snapshot(self.record)
+
+    def replace_existing(self, token: str) -> None:
+        self.written = {"target": TARGET_NAME, "token": token, "username": "forgejo-api-mcp"}
+        self.record = token
+
+    def read(self) -> str:
         if self.mismatch_once and self.written and not self.mismatch_used:
             self.mismatch_used = True
-            return CredentialRecord(
-                TARGET_NAME, "forgejo-api-mcp", "synthetic-mismatch", CRED_PERSIST_LOCAL_MACHINE
+            return "synthetic-mismatch"
+        if self.record is None:
+            raise CredentialOperationError(
+                CredentialCategory.MISSING,
+                credential_state="unchanged",
+                operation="read",
             )
         return self.record
 
-    def delete(self) -> None:
-        self.deleted = True
-        self.written = {}
-        self.record = None
+    def restore(self, snapshot: Snapshot) -> None:
+        self.record = snapshot.token
+        if snapshot.token is None:
+            self.deleted = True
+            self.written = {}
 
-    def restore(self, record: CredentialRecord) -> None:
-        self.record = record
+    def discard(self, snapshot: Snapshot) -> None:
+        snapshot.token = None
+        snapshot.discarded = True
+
+    def lock(self, *, timeout: float):
+        del timeout
+        return nullcontext()
 
 
 def _ok(request: httpx.Request) -> httpx.Response:
@@ -134,9 +159,7 @@ def test_rotation_never_logs_authorization_header_value(
 def test_rotation_mismatch_restores_prior_end_to_end(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    prior = CredentialRecord(
-        TARGET_NAME, "forgejo-api-mcp", "prior-integration-value", CRED_PERSIST_LOCAL_MACHINE
-    )
+    prior = "prior-integration-value"
     store = IntegrationStore(prior, mismatch_once=True)
     monkeypatch.setenv("FORGEJO_BASE_URL", "https://forgejo.example")
     monkeypatch.setattr(sys, "stdin", io.StringIO("new-integration-value\n"))

@@ -844,7 +844,8 @@ class ForgejoClient:
         once at server import. It deliberately never infers that a restart is unnecessary from a
         current HTTP 200. Classifies a 401 as ``credential_rejected``. Never returns the token,
         the ``Authorization`` header value, or the response body. The probe reuses this client's
-        process snapshot; it never re-reads the environment or Windows Credential Manager.
+        process snapshot; it never re-reads the environment or the platform credential store
+        (Windows Credential Manager or Linux Secret Service).
         """
 
         if not self._token:

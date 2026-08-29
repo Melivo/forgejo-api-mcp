@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_live_secret_service_smoke:
+        description: Run the isolated synthetic Secret Service smoke test
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  quality:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: https://github.com/actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: https://github.com/astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+          version: "0.10.10"
+      - name: Install locked project and development dependencies
+        run: uv sync --locked --python ${{ matrix.python }}
+      - name: Verify Linux-only credential dependencies
+        if: runner.os == 'Linux'
+        run: uv run python -c "import cryptography, jeepney, secretstorage"
+      - name: Verify SecretStorage is absent on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: uv run python -c "import importlib.util; assert importlib.util.find_spec('secretstorage') is None"
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Package build and isolated install
+        run: uv run pytest tests/test_packaged_install.py
+      - name: Full pytest suite
+        run: uv run pytest
+      - name: MCP initialize and lifecycle
+        run: uv run pytest tests/integration/test_mcp_lifecycle.py
+
+  live-secret-service-smoke:
+    if: ${{ inputs.run_live_secret_service_smoke == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: https://github.com/actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+      - uses: https://github.com/astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.10.10"
+      - name: Install isolated Secret Service runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes dbus-x11 gnome-keyring
+          uv sync --locked --python 3.14
+      - name: Run opt-in smoke with a synthetic credential in a dedicated D-Bus session
+        run: >-
+          dbus-run-session -- bash -lc
+          'eval "$(gnome-keyring-daemon --start --components=secrets)";
+          export RUN_LINUX_SECRETSERVICE_SMOKE=1;
+          export FORGEJO_LIVE_SECRET_SERVICE_ISOLATED=1;
+          uv run pytest tests/smoke/test_linux_secretservice.py'

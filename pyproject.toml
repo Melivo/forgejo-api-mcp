@@ -11,10 +11,13 @@ requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
     "mcp>=2.0.0",
+    "SecretStorage>=3.5,<4; sys_platform == 'linux'",
 ]
 
 [project.scripts]
 forgejo-api-mcp = "forgejo_api_mcp.server:main"
+forgejo-api-mcp-launch = "forgejo_api_mcp.launcher:main"
+forgejo-api-mcp-quarantine = "forgejo_api_mcp.quarantine:main"
 forgejo-api-mcp-rotate = "forgejo_api_mcp.rotate:main"
 
 [tool.hatch.build.targets.wheel]

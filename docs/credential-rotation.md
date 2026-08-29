@@ -1,152 +1,114 @@
-# Rotating the Forgejo access token
+# Credential rotation (canonical guide)
 
-The MCP server snapshots `FORGEJO_ACCESS_TOKEN` once at process start
-([`server.py`](../src/forgejo_api_mcp/server.py) constructs the client at import time). When a
-Forgejo token expires or is rotated in Windows Credential Manager, the **running** server keeps
-the stale token and Forgejo returns `401`. This project ships a project-owned rotation CLI and
-an in-band status probe so a stale token can be replaced and diagnosed without editing config.
+The common `forgejo-api-mcp-rotate` CLI reads one candidate from stdin, validates it before any
+store write, performs verified readback/rollback, and emits one redacted JSON result. It accepts
+no arguments and never accepts a token through argv, an environment variable, or an MCP tool.
 
-> Decision record: two approaches were considered. **A — project-owned Python rotation CLI +
-> MCP status probe via the ctypes Win32 Credential API (no new dependency)** was chosen over
-> **B — extending the external `credential-exec.ps1` wrapper** (not project-owned and not
-> testable in this repository). Runtime hot reload is out of scope because the server deliberately
-> retains its process-start snapshot.
+## Rotation
 
-## Prerequisites
-
-- Windows with PowerShell 5.1 or `pwsh`.
-- `uv` on `PATH` and this project synchronized with `uv sync`.
-- The Windows Credential Manager generic target `mcp/forgejo-mcp/access-token` (created/updated
-  by the rotation CLI below).
-
-## Rotate the token (stdin only)
-
-The rotation CLI reads the token **only from stdin** (a secure no-echo `getpass` prompt on a
-TTY, or a single piped line for automation). It never accepts the token as a command-line
-argument, environment value, or MCP tool argument, so it cannot leak into shell history, process
-listings, or MCP transcripts.
+```bash
+uv sync --locked
+printf '%s\n' '<token-placeholder>' | uv run forgejo-api-mcp-rotate
+```
 
 ```powershell
-# Interactive (no-echo prompt):
-uv run forgejo-api-mcp-rotate
-
-# Piped input is supported, but keep the value out of scripts and shell history.
+uv sync --locked
+"<token-placeholder>" | uv run forgejo-api-mcp-rotate
 ```
 
-The command accepts no arguments and has no username option. The non-secret UserName is fixed
-as `forgejo-api-mcp`. Set the non-secret `FORGEJO_BASE_URL` environment value when needed; it
-defaults to `https://forgejo.invalid`. Secret-like environment variables are ignored by the
-rotation command; the candidate credential is read from stdin only.
+For interactive use, omit the pipe and answer the no-echo stdin prompt. Do not put real values in
+scripts or shell history. Set only the non-secret `FORGEJO_BASE_URL` when needed; it must be HTTPS.
 
-### What the CLI does, in order
+## Dependency checks
 
-1. Checks that the Windows credential store is available **before stdin or network access**.
-2. Requires an HTTPS base URL before stdin or network access. Rotation never honors
-   `FORGEJO_ALLOW_INSECURE_HTTP`.
-3. Reads exactly one line from stdin and rejects empty or CR/LF/NUL-bearing input.
-4. Validates the candidate with a redirect-disabled, no-proxy HTTPS
-   `GET {base}/api/v1/user` (`follow_redirects=False`, `trust_env=False`) under an **absolute
-   wall-clock deadline** of at most 30 seconds. Classification uses the HTTP status only. The
-   response body is never consumed or parsed, and no provider login is processed.
-5. Acquires a bounded, user-scoped Windows named mutex in the `Local\\` namespace. Same-user
-   rotations serialize; different users do not block each other. An abandoned mutex is safely
-   acquired because readback and verified rollback make the transaction self-checking.
-6. Captures the full constrained prior record, then writes the candidate to the single target
-   `mcp/forgejo-mcp/access-token` via the Win32 `CredWriteW` API (ctypes) — the `cmdkey /pass`
-   route is deliberately avoided so the secret never reaches a process command line.
-7. Reads back with `CredReadW` and compares in constant time. A mismatch or read failure triggers
-   verified rollback: restore the prior `CredentialRecord`, or delete and verify absence when the
-   entry was new. Failed rollback verification reports `credentialState: unknown`.
-8. Releases the mutex in `finally` and prints one redacted JSON object.
-
-### Redacted output
-
-The raw token, credential blob, `Authorization` header value, response body, provider login, and
-token fingerprints are never logged or returned. Only these fields are emitted:
-
-```jsonc
-{
-  "target": "mcp/forgejo-mcp/access-token",
-  "status": "rotated",
-  "credentialState": "written",
-  "validatedAt": "2026-08-08T01:57:31+00:00",
-  "restartRequired": true,
-  "detail": "Credential rotated. Restart the MCP server so the launch wrapper reloads it."
-}
+```bash
+export FORGEJO_BASE_URL="https://<forgejo-host>"
+uv run python -c 'import importlib.util; assert importlib.util.find_spec("secretstorage") is not None; print("SecretStorage installed")'
 ```
 
-`restartRequired` is true only for a durable `rotated` result. The exact state table is:
-
-| # | Phase and outcome | Status | Exit | credentialState | Restart |
-|---:|---|---|---:|---|---|
-| 1 | platform/store unavailable | `platform_unsupported` | 9 | `unavailable` | no |
-| 2 | non-HTTPS base URL | `invalid_input` | 2 | `unchanged` | no |
-| 3 | empty or multiline candidate | `invalid_input` | 2 | `unchanged` | no |
-| 4 | any command argument, including token or username flags | `invalid_input` | 2 | `unchanged` | no |
-| 5 | HTTP 401 | `credential_rejected` | 3 | `unchanged` | no |
-| 6 | HTTP 403 | `forbidden` | 4 | `unchanged` | no |
-| 7 | other non-2xx response | `provider_error` | 5 | `unchanged` | no |
-| 8 | absolute deadline exceeded | `transport_or_timeout` | 6 | `unchanged` | no |
-| 9 | transport error | `transport_or_timeout` | 6 | `unchanged` | no |
-| 10 | user-scoped mutex wait times out; zero writes | `credential_store_error` | 7 | `unchanged` | no |
-| 11 | prior-record capture fails; zero writes | `credential_store_error` | 7 | `unchanged` | no |
-| 12 | credential write fails before commit | `credential_store_error` | 7 | `unchanged` | no |
-| 13 | readback equals candidate | `rotated` | 0 | `written` | **yes** |
-| 14 | mismatch; prior record restored and verified | `readback_mismatch` | 8 | `restored` | no |
-| 15 | mismatch; new entry deleted and verified | `readback_mismatch` | 8 | `deleted_new` | no |
-| 16 | readback fails; prior record restored and verified | `credential_store_error` | 7 | `restored` | no |
-| 17 | readback fails; new entry deleted and verified | `credential_store_error` | 7 | `deleted_new` | no |
-| 18 | rollback cannot be verified | `credential_store_error` | 7 | `unknown` | no |
-
-The complete exit-code vocabulary is `0`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, and `9` as mapped
-above.
-
-## Restart requirement (important)
-
-Rotation updates the credential store; it does **not** change the already-running MCP server,
-which keeps its startup snapshot. After a successful rotation (`status: rotated`), restart the
-MCP server so the launch wrapper ([`credential-launch.md`](credential-launch.md)) reloads the
-fresh token into the child-process environment.
-
-## Diagnose the running server: `provider_auth_status`
-
-Use the read-only `provider_auth_status` MCP tool to check whether the credential snapshotted at
-startup still works. It reuses the strict HTTPS, status-only probe and never re-reads Credential
-Manager. No snapshot credential returns `unconfigured` without a request. A non-HTTPS base URL
-returns `insecure_base_url` without a request. A `401` returns `credential_rejected`.
-
-```json
-{"usesStartupSnapshot": true, "restartRequiredAfterRotation": true, "snapshotStatus": "authenticated", "status_code": 200, "detail": "token authenticated"}
+```powershell
+$env:FORGEJO_BASE_URL = "https://<forgejo-host>"
+uv run python -c "import sys; assert sys.version_info >= (3, 12); print('Python dependency check passed')"
 ```
 
-```json
-{"usesStartupSnapshot": true, "restartRequiredAfterRotation": true, "snapshotStatus": "credential_rejected", "status_code": 401, "detail": "Forgejo rejected the token (401)"}
+## Setup and platform contracts
+
+Windows uses Credential Manager target `mcp/forgejo-mcp/access-token`; UserName is fixed to
+`forgejo-api-mcp`, with generic credentials and `CRED_PERSIST_LOCAL_MACHINE`. It uses Win32 APIs,
+not `cmdkey /pass`, and serializes same-user rotations across logon sessions with a bounded
+`Global\\forgejo-api-mcp-rotate-<current-user-SID>` mutex. The name is scoped only by the token SID,
+never a username. `CreateMutexExW` receives a protected DACL granting only that SID and SYSTEM the
+required synchronize/modify-state rights; the handle is non-inheritable.
+
+Linux requires `SecretStorage>=3.5,<4; sys_platform == 'linux'`, a D-Bus user session, a running
+Secret Service daemon, and one existing unlocked `default` collection. The exact one item is
+`application=forgejo-api-mcp`, `credential-kind=access-token`,
+`target=mcp/forgejo-mcp/access-token`, label `Forgejo API MCP access token`, content type
+`text/plain`. Runtime is strictly noninteractive: no unlock, prompt, creation/deletion,
+`secret-tool`, external command, raw D-Bus, or file fallback. A trusted manager provisions it.
+
+Before launch or rotation, the operator must use that trusted Secret Service manager to verify the
+current-user D-Bus session and running daemon, the existing unlocked `default` collection, exactly
+one matching item, the three exact immutable attributes above, label `Forgejo API MCP access token`,
+and content type `text/plain`. Record only redacted pass/fail results. The package path never
+performs this provisioning, unlocks, prompts, creates, deletes, or invokes a credential helper.
+
+Linux operations are fresh-worker, 5-second bounded operations. Before every mutating dispatch the
+backend durably installs a fixed non-secret quarantine fence in the private runtime directory. A
+confirmed worker response removes the provisional fence. A dispatched `replace_existing` or
+`restore` timeout leaves it installed because terminating the worker cannot cancel a D-Bus request
+already accepted by Secret Service. Rotation still performs one bounded diagnostic read, at most
+one restore, and one final bounded diagnostic read while holding the lock, but **always** reports
+`credentialState: unknown`; neither an immediate old-state read nor an apparent restore proves that
+a late commit cannot overtake it. A timeout proven to occur before dispatch removes the provisional
+fence and retains the prior unchanged-state contract. Stable
+redacted states distinguish missing, locked, prompt-required/dismissed, service unavailable,
+timeout, and store error. Candidate validation happens before the bounded per-user POSIX lock;
+the lock covers snapshot, replacement, readback, rollback/commit cleanup, and discard.
+
+While the fence is present, launcher reads and future rotations fail before Secret Service access
+with `store_error`, `credentialState: unknown`, and guidance ID
+`linux_secret_service_quarantine`. No automatic clear exists. After an operator has externally
+verified the exact fixed item and all attributes in a trusted Secret Service manager, confirmed the
+current-user daemon has settled or been restarted, and determined the intended credential value
+without recording it, use the secret-free package command:
+
+```bash
+uv run forgejo-api-mcp-quarantine check
+uv run forgejo-api-mcp-quarantine clear --operator-verified
 ```
 
-`usesStartupSnapshot` and `restartRequiredAfterRotation` are always true. A current HTTP 200 never
-means that a post-rotation restart can be skipped. Provider login data is never parsed or returned.
+`check` exits `0` for clear and `10` for quarantined. `clear --operator-verified` exits `0` after an
+atomic verified removal (and is idempotent when already clear). Invalid syntax, marker/store error,
+and unsupported platform exit `2`, `7`, and `9`. Output is one stable JSON object and never contains
+the runtime path, item metadata, or a secret. The acknowledgement flag records only that external
+verification was completed; this command deliberately does not read or mutate Secret Service.
+
+## Result and rollback
+
+Validation uses a redirect-disabled HTTPS status-only probe under an absolute wall-clock deadline.
+Only redacted fields are emitted:
+fixed `target`, status (including `credential_rejected`,
+`forbidden`, `provider_error`, and `rotated`), `credentialState`, timestamp,
+`restartRequired`, detail, and (where applicable) category/guidance ID. Successful `rotated`
+means readback matched and is the only result with `restartRequired: true` (exit `0`). Invalid
+input, provider rejection/error, timeout, store failure, rollback mismatch, and unsupported
+platform use exits `2, 3, 4, 5, 6, 7, 8, 9` respectively as documented by the CLI. Rollback
+restores and verifies the prior item, or deletes/verifies a newly created Windows entry. An
+unverifiable rollback returns `credential_store_error`, exit `7`, and
+`credentialState: unknown` without requiring a restart.
+
+## Restart and troubleshooting
+
+Rotation changes the store, not the running process. **Always restart the MCP server/host after
+a successful rotation** so the launcher reads the new startup snapshot. Then use the read-only
+`provider_auth_status` probe to check that snapshot. Troubleshooting must remain redacted; repair
+Linux setup with a trusted Secret Service manager or verify the Windows target/wrapper, then retry.
+The complete launch and provisioning guide is [`credential-launch.md`](credential-launch.md).
 
 ## Mandatory redacted local launcher verification
 
-Before release acceptance, an operator must perform a **manual, redacted, local Windows**
-verification that `credential-exec.ps1` reads its Credential Manager value and injects it into the
-server. This checks injection interoperability only; it must never rotate a production credential.
-Use either an explicitly authorized existing test/recovery credential or a documented manual
-operator check.
-
-Record only the target name and per-step `PASS`/`FAIL`; never record a token or `CredentialBlob`:
-
-1. `PASS`/`FAIL`: operator authorizes the existing non-production test/recovery credential or
-   documents the equivalent manual check.
-2. `PASS`/`FAIL`: wrapper starts/reloads the local server and injects that credential.
-3. `PASS`/`FAIL`: `provider_auth_status` reflects the startup credential's status without exposing
-   it.
-4. `PASS`/`FAIL`: an independent, redacted `CredReadW` check confirms the wrapper reads target
-   `mcp/forgejo-mcp/access-token`; do not print the blob.
-
-This manual local check is mandatory for the final gate. A non-production Forgejo CI verifier and
-automated Windows CI-runner attestation are not required by this workflow; they remain follow-up
-work in Serena todo
-`global/todos/setup-github-hosted-windows-runner-forgejo-credential-interop-20260809`.
-
-Never place credential material in JSON, shell history, test data, logs, or error reports.
+Before release acceptance on Windows, perform the existing non-production wrapper interoperability
+check of `credential-exec.ps1` and record only the fixed target plus PASS/FAIL: the wrapper reads Credential Manager,
+injects the child environment, and `provider_auth_status` reports the startup snapshot without
+exposing it. Never rotate production credentials or record a blob.

@@ -2,9 +2,9 @@
 
 Reads a candidate token ONLY from stdin (``getpass``, SecureString-equivalent, no echo),
 validates it with a bounded redirect-disabled HTTPS ``GET /api/v1/user`` BEFORE writing
-anything, writes it to the single Windows Credential Manager target
+anything, writes it to the platform credential backend at the fixed target
 ``mcp/forgejo-mcp/access-token``, verifies a local readback (restoring the prior value or
-deleting the new entry on mismatch), and prints a single redacted JSON object plus
+removing a newly created entry where supported on mismatch), and prints a redacted JSON object plus
 ``restartRequired``. The base URL must be HTTPS (the rotation path is intentionally stricter
 than the client and ignores ``FORGEJO_ALLOW_INSECURE_HTTP``). The raw token, the
 ``Authorization`` header value, and the response body are never logged or returned. The
@@ -16,27 +16,24 @@ from __future__ import annotations
 
 import asyncio
 import getpass
-import hmac
+import ipaddress
 import json
 import os
 import sys
-import types
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
+import httpx
+
 from .client import DEFAULT_BASE_URL
-from .credentials import (
+from .credential_backend import (
     TARGET_NAME,
-    CredentialRecord,
-    CredentialStoreError,
-    CredentialStoreUnavailable,
-    RotationMutexTimeout,
-    _ensure_store_available,
-    _rotation_lock,
-    delete_credential,
-    read_credential,
-    restore_credential,
-    write_credential,
+    CredentialBackend,
+    CredentialCategory,
+    CredentialOperationError,
+    CredentialSnapshot,
+    PlatformUnsupported,
+    select_credential_backend,
 )
 from .errors import InputValidationError
 from .provider_auth import AUTHENTICATED, INSECURE_BASE_URL, classify_token
@@ -66,14 +63,16 @@ def _now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
-def _default_store() -> types.SimpleNamespace:
-    return types.SimpleNamespace(
-        write=write_credential,
-        read=read_credential,
-        delete=delete_credential,
-        restore=restore_credential,
-        ensure_available=_ensure_store_available,
-    )
+def _as_backend(store: object) -> CredentialBackend:
+    if isinstance(store, CredentialBackend):
+        return store
+    raise TypeError("store must implement CredentialBackend")
+
+
+def _default_store() -> CredentialBackend:
+    """Select the platform adapter once at the credential boundary."""
+
+    return select_credential_backend()
 
 
 def _redacted(
@@ -82,8 +81,10 @@ def _redacted(
     credential_state: str,
     now: str,
     detail: str,
+    category: str | None = None,
+    guidance_id: str | None = None,
 ) -> dict[str, object]:
-    return {
+    output: dict[str, object] = {
         "target": TARGET_NAME,
         "status": status,
         "credentialState": credential_state,
@@ -91,6 +92,148 @@ def _redacted(
         "restartRequired": status == "rotated",
         "detail": detail,
     }
+    if category is not None:
+        output["category"] = category
+    if guidance_id is not None:
+        output["guidanceId"] = guidance_id
+    return output
+
+
+def _credential_failure(
+    error: CredentialOperationError,
+    *,
+    now: str,
+    state: str | None = None,
+) -> tuple[int, dict[str, object]]:
+    lock_timeout = (
+        error.category is CredentialCategory.TIMEOUT
+        and error.operation == "lock"
+        and error.guidance_id is None
+    )
+    detail = (
+        "Another same-user credential rotation is still in progress."
+        if lock_timeout
+        else "Credential store operation failed; use the documented platform setup and retry."
+    )
+    return EXIT_CREDENTIAL_STORE_ERROR, _redacted(
+        status="credential_store_error",
+        category=error.category.value,
+        credential_state=state or error.credential_state,
+        now=now,
+        detail=detail,
+        guidance_id=error.guidance_id,
+    )
+
+
+def _rollback(backend: CredentialBackend, snapshot: CredentialSnapshot) -> str:
+    try:
+        backend.restore(snapshot)
+    except CredentialOperationError as error:
+        if error.indeterminate:
+            try:
+                backend.read()
+            except CredentialOperationError:
+                pass
+            raise CredentialOperationError(
+                error.category,
+                credential_state="unknown",
+                operation=error.operation,
+                indeterminate=True,
+                guidance_id=error.guidance_id,
+            ) from None
+        raise
+    try:
+        backend.read()
+    except CredentialOperationError as error:
+        if snapshot.present or error.category is not CredentialCategory.MISSING:
+            raise
+    return "restored" if snapshot.present else "deleted_new"
+
+
+def _recover_indeterminate_write(
+    backend: CredentialBackend,
+    snapshot: CredentialSnapshot,
+    write_error: CredentialOperationError,
+    *,
+    now: str,
+) -> tuple[int, dict[str, object]]:
+    """Collect bounded evidence and restore once without claiming D-Bus cancellation."""
+
+    try:
+        backend.read()
+    except CredentialOperationError:
+        pass
+    outcome_error = write_error
+    try:
+        backend.restore(snapshot)
+    except CredentialOperationError as restore_error:
+        outcome_error = restore_error
+
+    try:
+        backend.read()
+    except CredentialOperationError as final_read_error:
+        if outcome_error is write_error:
+            outcome_error = final_read_error
+
+    unknown = CredentialOperationError(
+        outcome_error.category,
+        credential_state="unknown",
+        operation=outcome_error.operation,
+        indeterminate=True,
+        guidance_id=write_error.guidance_id or outcome_error.guidance_id,
+    )
+    return _credential_failure(unknown, now=now)
+
+
+
+def _valid_rotation_hostname(hostname: str) -> bool:
+    if not hostname or any(character.isspace() or ord(character) < 32 for character in hostname):
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    if len(ascii_hostname) > 253:
+        return False
+    labels = ascii_hostname.split(".")
+    return bool(labels) and all(
+        0 < len(label) <= 63
+        and label[0].isalnum()
+        and label[-1].isalnum()
+        and all(character.isalnum() or character == "-" for character in label)
+        for label in labels
+    )
+
+
+def _valid_rotation_base_url(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if any(ord(character) <= 0x1F or ord(character) == 0x7F for character in value):
+        return False
+    candidate = value.strip()
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        _port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        parsed.scheme.casefold() == "https"
+        and parsed.netloc
+        and hostname
+        and _valid_rotation_hostname(hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and "?" not in candidate
+        and "#" not in candidate
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def _run(
@@ -98,34 +241,22 @@ def _run(
     *,
     base_url: str,
     transport: object | None = None,
-    store: types.SimpleNamespace | None = None,
-    lock_factory: object = _rotation_lock,
+    store: object | None = None,
+    lock_factory: object | None = None,
     lock_timeout: float = 30.0,
-    platform_checked: bool = False,
 ) -> tuple[int, dict[str, object]]:
-    """Validate, serialize the store transaction, verify readback, and roll back on failure."""
-
-    store = store or _default_store()
+    """Validate outside the lock, then run one locked snapshot transaction."""
     now = _now_iso()
-    if not platform_checked:
-        try:
-            ensure_available = getattr(store, "ensure_available", None)
-            if ensure_available is not None:
-                ensure_available()
-        except CredentialStoreUnavailable:
-            return EXIT_PLATFORM_UNSUPPORTED, _redacted(
-                status="platform_unsupported",
-                credential_state="unavailable",
-                now=now,
-                detail="Windows Credential Manager is not available on this host.",
-            )
-        except CredentialStoreError:
-            return EXIT_CREDENTIAL_STORE_ERROR, _redacted(
-                status="credential_store_error",
-                credential_state="unchanged",
-                now=now,
-                detail="Windows Credential Manager availability check failed.",
-            )
+    try:
+        selected = _default_store() if store is None else _as_backend(store)
+    except PlatformUnsupported:
+        return EXIT_PLATFORM_UNSUPPORTED, _redacted(
+            status="platform_unsupported",
+            credential_state="unavailable",
+            now=now,
+            detail="Credential storage is not supported on this platform.",
+        )
+
     if (
         not isinstance(token, str)
         or not token
@@ -140,20 +271,23 @@ def _run(
             detail="token must be a single non-empty line without CR/LF/NUL",
         )
 
-    if not isinstance(base_url, str) or urlsplit(base_url.strip()).scheme.casefold() != "https":
+    if not _valid_rotation_base_url(base_url):
         return EXIT_INVALID_INPUT, _redacted(
             status="invalid_input",
             credential_state="unchanged",
             now=now,
-            detail="Forgejo base URL must use HTTPS.",
+            detail="Forgejo base URL is invalid.",
         )
     try:
         result = asyncio.run(
             classify_token(token, base_url=base_url, transport=transport)  # type: ignore[arg-type]
         )
-    except InputValidationError as error:
+    except (InputValidationError, httpx.InvalidURL):
         return EXIT_INVALID_INPUT, _redacted(
-            status="invalid_input", credential_state="unchanged", now=now, detail=str(error)
+            status="invalid_input",
+            credential_state="unchanged",
+            now=now,
+            detail="Forgejo base URL is invalid.",
         )
 
     if result.status != AUTHENTICATED:
@@ -174,128 +308,63 @@ def _run(
             detail=result.detail,
         )
 
-    prior: object = None
-    write_succeeded = False
+    factory = lock_factory if lock_factory is not None else selected.lock
+    snapshot: CredentialSnapshot | None = None
     try:
-        with lock_factory(timeout=lock_timeout):  # type: ignore[operator]
+        with factory(timeout=lock_timeout):  # type: ignore[operator]
             try:
-                prior = store.read()
-            except CredentialStoreError:
-                return EXIT_CREDENTIAL_STORE_ERROR, _redacted(
-                    status="credential_store_error",
-                    credential_state="unchanged",
-                    now=now,
-                    detail="Could not capture the prior credential before writing.",
-                )
+                snapshot = selected.snapshot()
+            except CredentialOperationError as error:
+                return _credential_failure(error, now=now)
 
             try:
-                store.write(token)
-                write_succeeded = True
-            except CredentialStoreError:
-                return EXIT_CREDENTIAL_STORE_ERROR, _redacted(
-                    status="credential_store_error",
-                    credential_state="unchanged",
-                    now=now,
-                    detail="Credential Manager rejected the write.",
-                )
+                try:
+                    selected.replace_existing(token)
+                except CredentialOperationError as error:
+                    if error.indeterminate:
+                        return _recover_indeterminate_write(selected, snapshot, error, now=now)
+                    return _credential_failure(error, now=now)
 
-            readback_failed = False
-            try:
-                stored = store.read()
-            except CredentialStoreError:
-                stored = None
-                readback_failed = True
+                try:
+                    stored = selected.read()
+                except CredentialOperationError as error:
+                    try:
+                        state = _rollback(selected, snapshot)
+                    except CredentialOperationError as rollback_error:
+                        return _credential_failure(rollback_error, now=now, state="unknown")
+                    return _credential_failure(error, now=now, state=state)
 
-            if not readback_failed and _records_match(stored, token):
-                return EXIT_ROTATED, _redacted(
-                    status="rotated",
-                    credential_state="written",
-                    now=now,
-                    detail="Credential rotated. Restart the MCP server so the launch wrapper reloads it.",
-                )
+                if stored == token:
+                    return EXIT_ROTATED, _redacted(
+                        status="rotated",
+                        credential_state="written",
+                        now=now,
+                        detail=(
+                            "Credential rotated. Restart the MCP server so the launch wrapper "
+                            "reloads it."
+                        ),
+                    )
 
-            rollback_state = _verified_rollback(store, prior)
-            if rollback_state == "unknown":
-                return EXIT_CREDENTIAL_STORE_ERROR, _redacted(
-                    status="credential_store_error",
-                    credential_state="unknown",
-                    now=now,
-                    detail="Readback failed and rollback could not be verified.",
-                )
-            if readback_failed:
-                return EXIT_CREDENTIAL_STORE_ERROR, _redacted(
-                    status="credential_store_error",
+                try:
+                    rollback_state = _rollback(selected, snapshot)
+                except CredentialOperationError as error:
+                    return _credential_failure(error, now=now, state="unknown")
+                return EXIT_READBACK_MISMATCH, _redacted(
+                    status="readback_mismatch",
                     credential_state=rollback_state,
                     now=now,
-                    detail="Credential readback failed; the prior state was restored and verified.",
+                    detail="Credential readback mismatched; the prior state was restored and verified.",
                 )
-            return EXIT_READBACK_MISMATCH, _redacted(
-                status="readback_mismatch",
-                credential_state=rollback_state,
-                now=now,
-                detail="Credential readback mismatched; the prior state was restored and verified.",
-            )
-    except RotationMutexTimeout:
-        return EXIT_CREDENTIAL_STORE_ERROR, _redacted(
-            status="credential_store_error",
-            credential_state="unchanged",
+            finally:
+                if snapshot is not None:
+                    selected.discard(snapshot)
+    except CredentialOperationError as error:
+        return _credential_failure(
+            error,
             now=now,
-            detail="Another same-user credential rotation is still in progress.",
-        )
-    except CredentialStoreUnavailable:
-        return EXIT_PLATFORM_UNSUPPORTED, _redacted(
-            status="platform_unsupported",
-            credential_state="unavailable",
-            now=now,
-            detail="Windows Credential Manager is not available on this host.",
-        )
-    except CredentialStoreError:
-        if write_succeeded:
-            rollback_state = _verified_rollback(store, prior)
-            return EXIT_CREDENTIAL_STORE_ERROR, _redacted(
-                status="credential_store_error",
-                credential_state=rollback_state,
-                now=now,
-                detail=(
-                    "Credential transaction failed after writing; rollback was attempted and "
-                    "verified."
-                    if rollback_state != "unknown"
-                    else "Credential transaction failed after writing and rollback is unverified."
-                ),
-            )
-        return EXIT_CREDENTIAL_STORE_ERROR, _redacted(
-            status="credential_store_error",
-            credential_state="unchanged",
-            now=now,
-            detail="Credential Manager transaction failed.",
+            state="unknown" if snapshot is not None else None,
         )
 
-
-def _records_match(record: object, token: str) -> bool:
-    return isinstance(record, CredentialRecord) and hmac.compare_digest(
-        record.credential_blob, token
-    )
-
-
-def _same_record(left: object, right: CredentialRecord) -> bool:
-    return (
-        isinstance(left, CredentialRecord)
-        and left.target == right.target
-        and left.username == right.username
-        and left.persist_type == right.persist_type
-        and hmac.compare_digest(left.credential_blob, right.credential_blob)
-    )
-
-
-def _verified_rollback(store: types.SimpleNamespace, prior: object) -> str:
-    try:
-        if isinstance(prior, CredentialRecord):
-            store.restore(prior)
-            return "restored" if _same_record(store.read(), prior) else "unknown"
-        store.delete()
-        return "deleted_new" if store.read() is None else "unknown"
-    except CredentialStoreError:
-        return "unknown"
 
 
 def _read_token() -> str:
@@ -323,36 +392,22 @@ def main(
     argv: list[str] | None = None,
     *,
     transport: object | None = None,
-    store: types.SimpleNamespace | None = None,
+    store: object | None = None,
 ) -> int:
     """Console-script entry point. Returns the rotation exit code."""
 
-    store = store or _default_store()
     try:
-        ensure_available = getattr(store, "ensure_available", None)
-        if ensure_available is not None:
-            ensure_available()
-    except CredentialStoreUnavailable:
+        selected: object = _default_store() if store is None else store
+    except PlatformUnsupported:
         _emit(
             _redacted(
                 status="platform_unsupported",
                 credential_state="unavailable",
                 now=_now_iso(),
-                detail="Windows Credential Manager is not available on this host.",
+                detail="Credential storage is not supported on this platform.",
             )
         )
         return EXIT_PLATFORM_UNSUPPORTED
-    except CredentialStoreError:
-        _emit(
-            _redacted(
-                status="credential_store_error",
-                credential_state="unchanged",
-                now=_now_iso(),
-                detail="Windows Credential Manager availability check failed.",
-            )
-        )
-        return EXIT_CREDENTIAL_STORE_ERROR
-
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments:
         _emit(
@@ -366,13 +421,13 @@ def main(
         return EXIT_INVALID_INPUT
 
     base_url = os.getenv("FORGEJO_BASE_URL", DEFAULT_BASE_URL)
-    if urlsplit(base_url.strip()).scheme.casefold() != "https":
+    if not _valid_rotation_base_url(base_url):
         _emit(
             _redacted(
                 status="invalid_input",
                 credential_state="unchanged",
                 now=_now_iso(),
-                detail="Forgejo base URL must use HTTPS.",
+                detail="Forgejo base URL is invalid.",
             )
         )
         return EXIT_INVALID_INPUT
@@ -393,8 +448,7 @@ def main(
         token,
         base_url=base_url,
         transport=transport,
-        store=store,
-        platform_checked=True,
+        store=selected,
     )
     _emit(output)
     return exit_code

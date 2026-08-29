@@ -114,7 +114,8 @@ async def invoke_operation(
     description=(
         "Probe the STARTUP-snapshotted Forgejo credential with a strict-HTTPS, redirect-disabled, "
         "status-only GET /api/v1/user under an absolute <=30s deadline; the response body is never "
-        "consumed. This tool does NOT re-read Windows Credential Manager. A 401 is classified as "
+        "consumed. This tool does NOT re-read the platform credential store (Windows Credential "
+        "Manager or Linux Secret Service). A 401 is classified as "
         "credential_rejected. Rotation ALWAYS requires restarting the MCP server "
         "(restartRequiredAfterRotation=true), even when the current snapshot returns HTTP 200. "
         "Never returns the token, header value, response body, or provider login."

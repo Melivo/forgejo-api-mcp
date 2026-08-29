@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from forgejo_api_mcp import credentials
+from forgejo_api_mcp.credential_backend import CredentialCategory, CredentialOperationError
 from forgejo_api_mcp.credentials import (
     CRED_PERSIST_LOCAL_MACHINE,
     TARGET_NAME,
@@ -53,9 +54,18 @@ class FakeKernel32:
         self.released = 0
         self.closed = 0
 
-    def CreateMutexW(self, _attributes: object, _owner: bool, name: str) -> int:
+    def CreateMutexExW(
+        self,
+        _attributes: object,
+        name: str,
+        _flags: int,
+        _desired_access: int,
+    ) -> int:
         self.created_names.append(name)
         return 42
+
+    def LocalFree(self, _descriptor: object) -> int:
+        return 0
 
     def WaitForSingleObject(self, _handle: int, _milliseconds: int) -> int:
         return self.wait_result
@@ -69,22 +79,44 @@ class FakeKernel32:
         return 1
 
 
-def test_rotation_lock_acquires_releases_and_is_local_user_scoped() -> None:
+def _mock_mutex_security(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        credentials,
+        "_build_mutex_security_attributes",
+        lambda _sid: (credentials._SECURITY_ATTRIBUTES(), ctypes.c_void_p(0x1234)),
+    )
+
+
+def test_rotation_lock_acquires_releases_and_is_global_user_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_mutex_security(monkeypatch)
     kernel = FakeKernel32(credentials.WAIT_OBJECT_0)
     with credentials._rotation_lock(
-        timeout=0.01, kernel32=kernel, name="Local\\forgejo-api-mcp-rotate-S-1-5-21-test"
+        timeout=0.01,
+        kernel32=kernel,
+        name="Global\\forgejo-api-mcp-rotate-S-1-5-21-test",
+        sid="S-1-5-21-test",
     ) as lock:
         assert lock.abandoned is False
-    assert kernel.created_names == ["Local\\forgejo-api-mcp-rotate-S-1-5-21-test"]
+    assert kernel.created_names == ["Global\\forgejo-api-mcp-rotate-S-1-5-21-test"]
     assert kernel.released == 1
     assert kernel.closed == 1
 
 
-def test_rotation_lock_abandoned_proceeds_and_finally_releases() -> None:
+def test_rotation_lock_abandoned_proceeds_and_finally_releases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_mutex_security(monkeypatch)
     kernel = FakeKernel32(credentials.WAIT_ABANDONED)
     with (
         pytest.raises(RuntimeError),
-        credentials._rotation_lock(timeout=0.01, kernel32=kernel, name="Local\\test") as lock,
+        credentials._rotation_lock(
+            timeout=0.01,
+            kernel32=kernel,
+            name="Global\\forgejo-api-mcp-rotate-S-1-5-21-test",
+            sid="S-1-5-21-test",
+        ) as lock,
     ):
         assert lock.abandoned is True
         raise RuntimeError("synthetic failure")
@@ -92,15 +124,46 @@ def test_rotation_lock_abandoned_proceeds_and_finally_releases() -> None:
     assert kernel.closed == 1
 
 
-def test_rotation_lock_timeout_closes_without_releasing() -> None:
+def test_rotation_lock_timeout_closes_without_releasing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_mutex_security(monkeypatch)
     kernel = FakeKernel32(credentials.WAIT_TIMEOUT)
     with (
         pytest.raises(credentials.RotationMutexTimeout),
-        credentials._rotation_lock(timeout=0.001, kernel32=kernel, name="Local\\test"),
+        credentials._rotation_lock(
+            timeout=0.001,
+            kernel32=kernel,
+            name="Global\\forgejo-api-mcp-rotate-S-1-5-21-test",
+            sid="S-1-5-21-test",
+        ),
     ):
         pytest.fail("timed-out lock must not enter")
     assert kernel.released == 0
     assert kernel.closed == 1
+
+
+def test_windows_backend_normalizes_private_lock_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimedOutLock:
+        def __enter__(self) -> None:
+            raise credentials.RotationMutexTimeout("private timeout detail")
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    monkeypatch.setattr(credentials, "_rotation_lock", lambda **_kwargs: TimedOutLock())
+    lock = credentials.WindowsCredentialBackend().lock(timeout=0.01)
+    with pytest.raises(CredentialOperationError) as caught, lock:
+        pytest.fail("timed-out lock must not enter")
+
+    assert caught.value.category is CredentialCategory.TIMEOUT
+    assert caught.value.operation == "lock"
+    assert caught.value.credential_state == "unchanged"
+    assert caught.value.guidance_id is None
+    assert caught.value.__cause__ is None
+    assert "private timeout detail" not in repr(caught.value)
 
 
 class FakeStore:
@@ -204,13 +267,123 @@ def test_rotation_lock_is_unavailable_off_windows(monkeypatch: pytest.MonkeyPatc
         credentials._rotation_lock()
 
 
-def test_rotation_mutex_name_uses_local_namespace_and_current_user_sid(
+def test_rotation_mutex_name_uses_global_namespace_and_current_user_sid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(credentials, "_current_user_sid", lambda: "S-1-5-21-1234")
     name = credentials._rotation_mutex_name()
-    assert name == "Local\\forgejo-api-mcp-rotate-S-1-5-21-1234"
-    assert not name.startswith("Global\\")
+    assert name == "Global\\forgejo-api-mcp-rotate-S-1-5-21-1234"
+    assert not name.startswith("Local\\")
+
+
+def test_rotation_lock_reuses_mutex_name_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_mutex_security(monkeypatch)
+    calls: list[str | None] = []
+
+    def mutex_name(sid: str | None = None) -> str:
+        calls.append(sid)
+        return f"Global\\forgejo-api-mcp-rotate-{sid}"
+
+    monkeypatch.setattr(credentials, "_rotation_mutex_name", mutex_name)
+    kernel = FakeKernel32(credentials.WAIT_OBJECT_0)
+    with credentials._rotation_lock(timeout=0.01, kernel32=kernel, sid="S-1-5-21-test"):
+        pass
+
+    assert calls == ["S-1-5-21-test"]
+
+
+def test_rotation_mutex_name_fails_closed_without_sid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(credentials, "_current_user_sid", lambda: None)
+    with pytest.raises(CredentialStoreError):
+        credentials._rotation_mutex_name()
+
+
+def test_mutex_security_descriptor_is_protected_sid_and_system_only() -> None:
+    class FakeAdvapi32:
+        def __init__(self) -> None:
+            self.sddl = ""
+            self.revision = 0
+
+        def ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            self,
+            sddl: str,
+            revision: int,
+            descriptor_out: object,
+            _size: object,
+        ) -> int:
+            self.sddl = sddl
+            self.revision = revision
+            ctypes.cast(
+                descriptor_out,
+                ctypes.POINTER(ctypes.c_void_p),
+            )[0] = ctypes.c_void_p(0x1234)
+            return 1
+
+    advapi32 = FakeAdvapi32()
+    attributes, descriptor = credentials._build_mutex_security_attributes(
+        "S-1-5-21-1234",
+        advapi32=advapi32,
+    )
+    assert advapi32.sddl == (
+        "D:P"
+        "(A;;0x00100001;;;SY)"
+        "(A;;0x00100001;;;S-1-5-21-1234)"
+    )
+    assert advapi32.revision == credentials.SDDL_REVISION_1
+    assert attributes.nLength == ctypes.sizeof(credentials._SECURITY_ATTRIBUTES)
+    assert not attributes.bInheritHandle
+    assert attributes.lpSecurityDescriptor == descriptor.value == 0x1234
+
+
+def test_rotation_lock_uses_required_access_and_frees_security_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SecureKernel(FakeKernel32):
+        def __init__(self) -> None:
+            super().__init__(credentials.WAIT_OBJECT_0)
+            self.desired_access: list[int] = []
+            self.security_attributes: list[object] = []
+            self.freed: list[int] = []
+
+        def CreateMutexExW(
+            self,
+            attributes: object,
+            name: str,
+            _flags: int,
+            desired_access: int,
+        ) -> int:
+            self.security_attributes.append(attributes)
+            self.created_names.append(name)
+            self.desired_access.append(desired_access)
+            return 42
+
+        def LocalFree(self, descriptor: object) -> int:
+            self.freed.append(int(ctypes.cast(descriptor, ctypes.c_void_p).value or 0))
+            return 0
+
+    kernel = SecureKernel()
+    attributes = credentials._SECURITY_ATTRIBUTES()
+    descriptor = ctypes.c_void_p(0x1234)
+    monkeypatch.setattr(
+        credentials,
+        "_build_mutex_security_attributes",
+        lambda _sid: (attributes, descriptor),
+    )
+    with credentials._rotation_lock(
+        timeout=0.01,
+        kernel32=kernel,
+        name="Global\\forgejo-api-mcp-rotate-S-1-5-21-1234",
+        sid="S-1-5-21-1234",
+    ):
+        pass
+    assert kernel.created_names == ["Global\\forgejo-api-mcp-rotate-S-1-5-21-1234"]
+    assert kernel.desired_access == [credentials.MUTEX_REQUIRED_ACCESS]
+    assert kernel.security_attributes[0] is not None
+    assert kernel.freed == [0x1234]
 
 
 def test_encode_and_decode_blob_round_trip() -> None:
@@ -278,15 +451,15 @@ class FakeWin32Library:
         self.freed = 0
 
     def CredWriteW(self, _cred_ref: Any, _flags: int) -> int:
-        ctypes.set_last_error(self.last_error)
+        ctypes.set_last_error(self.last_error)  # type: ignore[attr-defined]
         return 1 if self.write_ok else 0
 
     def CredReadW(self, _target: str, _cred_type: int, _flags: int, _out_ref: Any) -> int:
-        ctypes.set_last_error(self.last_error)
+        ctypes.set_last_error(self.last_error)  # type: ignore[attr-defined]
         return 1 if self.read_ok else 0
 
     def CredDeleteW(self, _target: str, _cred_type: int, _flags: int) -> int:
-        ctypes.set_last_error(self.last_error)
+        ctypes.set_last_error(self.last_error)  # type: ignore[attr-defined]
         return 1 if self.delete_ok else 0
 
     def CredFree(self, _pointer: Any) -> None:
@@ -295,8 +468,21 @@ class FakeWin32Library:
 
 @pytest.fixture
 def win32_env(monkeypatch: pytest.MonkeyPatch):
+    last_error = 0
+
+    def set_last_error(value: int) -> int:
+        nonlocal last_error
+        previous = last_error
+        last_error = value
+        return previous
+
+    def get_last_error() -> int:
+        return last_error
+
     monkeypatch.setattr(credentials, "_advapi32", None)
     monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "set_last_error", set_last_error, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", get_last_error, raising=False)
     return monkeypatch
 
 
@@ -374,3 +560,48 @@ def test_load_advapi32_caches_the_bound_library(
     assert credentials._load_advapi32() is sentinel
     assert credentials._load_advapi32() is sentinel
     assert calls["n"] == 1
+
+
+def test_win32_mutex_and_security_descriptor_abi_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Procedure:
+        argtypes: list[object] | None = None
+        restype: object = None
+
+    class Library:
+        def __init__(self) -> None:
+            self._procedures: dict[str, Procedure] = {}
+
+        def __getattr__(self, name: str) -> Procedure:
+            return self._procedures.setdefault(name, Procedure())
+
+    libraries: dict[str, Library] = {}
+
+    def win_dll(name: str, *, use_last_error: bool) -> Library:
+        assert use_last_error is True
+        library = Library()
+        libraries[name] = library
+        return library
+
+    monkeypatch.setattr(ctypes, "WinDLL", win_dll, raising=False)
+    kernel32 = credentials._bind_kernel32()
+    advapi32 = credentials._bind_advapi32()
+
+    assert kernel32.CreateMutexExW.argtypes == [
+        ctypes.POINTER(credentials._SECURITY_ATTRIBUTES),
+        credentials.wintypes.LPCWSTR,
+        credentials.wintypes.DWORD,
+        credentials.wintypes.DWORD,
+    ]
+    assert kernel32.CreateMutexExW.restype is credentials.wintypes.HANDLE
+    assert advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes == [
+        credentials.wintypes.LPCWSTR,
+        credentials.wintypes.DWORD,
+        ctypes.POINTER(credentials.wintypes.LPVOID),
+        credentials.wintypes.LPDWORD,
+    ]
+    assert (
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype
+        is credentials.wintypes.BOOL
+    )
