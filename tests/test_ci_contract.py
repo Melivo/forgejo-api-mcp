@@ -31,23 +31,23 @@ def test_every_external_action_is_pinned_to_a_reviewed_full_sha() -> None:
         encoding="utf-8"
     )
     actions = re.findall(
-        r"^\s*- uses: (https://github\.com/[^@\s]+)@([0-9a-f]{40})\s+#\s+(v\d+)\s*$",
+        r"^\s*- uses: ([^@\s]+/[^@\s]+)@([0-9a-f]{40})\s+#\s+(v\d+)\s*$",
         workflow,
         flags=re.MULTILINE,
     )
     assert actions == [
         (
-            "https://github.com/actions/checkout",
+            "actions/checkout",
             "11d5960a326750d5838078e36cf38b85af677262",
             "v4",
         ),
         (
-            "https://github.com/actions/setup-python",
+            "actions/setup-python",
             "ece7cb06caefa5fff74198d8649806c4678c61a1",
             "v6",
         ),
         (
-            "https://github.com/astral-sh/setup-uv",
+            "astral-sh/setup-uv",
             "37802adc94f370d6bfd71619e3f0bf239e1f3b78",
             "v7",
         ),
