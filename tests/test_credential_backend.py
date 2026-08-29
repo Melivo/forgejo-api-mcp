@@ -87,11 +87,14 @@ def test_selector_fails_closed_for_an_unsupported_platform() -> None:
     assert str(caught.value) == "credential backend is unsupported on this platform"
 
 
-def test_quarantine_selector_reuses_platform_selection_and_fails_closed() -> None:
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux backend requires POSIX fcntl")
+def test_quarantine_selector_reuses_linux_platform_selection() -> None:
     selected = select_quarantine_backend(platform="linux")
     assert isinstance(selected, QuarantineBackend)
     assert type(selected).__name__ == "LinuxCredentialBackend"
 
+
+def test_quarantine_selector_fails_closed_on_windows() -> None:
     with pytest.raises(PlatformUnsupported) as caught:
         select_quarantine_backend(platform="win32")
     assert str(caught.value) == "credential backend is unsupported on this platform"
