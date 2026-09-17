@@ -120,3 +120,7 @@ clear only after trusted external item verification and Secret Service settlemen
 uv run ruff check .
 uv run pytest
 ```
+
+## License
+
+Licensed under the [MIT License](LICENSE).

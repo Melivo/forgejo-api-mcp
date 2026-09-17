@@ -7,12 +7,17 @@ name = "forgejo-api-mcp"
 version = "0.1.0"
 description = "A spec-driven MCP server for the Forgejo REST API"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
     "mcp>=2.0.0",
     "SecretStorage>=3.5,<4; sys_platform == 'linux'",
 ]
+
+[project.urls]
+Repository = "https://github.com/Melivo/forgejo-api-mcp"
+Issues = "https://github.com/Melivo/forgejo-api-mcp/issues"
 
 [project.scripts]
 forgejo-api-mcp = "forgejo_api_mcp.server:main"
